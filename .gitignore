@@ -5,3 +5,13 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# 学習済みの重みは公開リポジトリに入れない（手元でビルド時に差し込む）
+plugin/Source/nn/EmbeddedWeights.h
+*.swmodel
+best.pt
+training/checkpoints/
+
+# ダウンロードした学習データはコミットしない
+training/data/
+data/

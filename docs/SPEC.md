@@ -10,6 +10,10 @@
 * **ソフトのバージョン**: 最初のリリースは **`v0.1.0`**（本書の実装対象）。狭帯域ノッチ（Stage 6B）を足すリリースは **`v0.2.0`**。
 * **保存データ・重みファイルの番号**: `state_version="1"` と Magic `"SWZFB004"` はそれぞれ独立した形式番号で、ソフトのバージョンとは連動しない。
 
+### v1.6 への追記（Step 3 着手時に確定）
+1. **第3.2節 `EmbeddedWeights.h`**: 学習済みの重みは公開リポジトリには入れず、手元でビルド時に差し込む（個人利用専用。非商用データで学習した重みの公開は配布に当たるため）。
+2. **第4.2節 ライセンス監査**: 非商用データを含む重みは個人利用専用・公開／配布しないことを明記。
+
 ### v1.5 からの変更点（Step 2 実装時の検証で確定）
 1. **第3.1節・第5章 FMA の扱い**: NN の内積（GEMV・Conv1d・LayerNorm の分散）に限り、明示的な積和融合命令を使ってよい。DSP 経路（第2章）は従来どおり使わない。
 2. **第3.2節 `EmbeddedWeights.h`**: 学習済みの重みができる Step 3 までは、固定の試験用重み（seed 42 の疑似乱数。学習済みモデルではない）からビルド時に生成する。
@@ -363,7 +367,7 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
 
 ### 3.2 バイナリ重みフォーマット（`.swmodel` / `EmbeddedWeights.h`）規範レイアウト
 * **共有メモリ規約**: `EmbeddedWeights` は `alignas(64) inline constexpr float[]`（名前空間 `zerofb::embedded`、`kWeights` / `kWeightCount` / `kPayloadCrc32`）としてプロセス内全インスタンスで **Read-Only 1コピー共有**し、マルチインスタンス時の L2 キャッシュ溢れを防止する。各値は16進浮動小数点リテラルで書き出し、`.swmodel` の Payload とビット単位で一致させる。
-* **生成元**: Step 3 で学習済みの重みができるまでは、`training/export_weights.py --random-test` がビルド時に `<build>/generated/nn/EmbeddedWeights.h` を生成する（固定の試験用重み。seed 42 の疑似乱数で、スケールは第3.1節の初期化に合わせ、全バイアスと LayerNorm 係数を非ゼロ、ヘッドの重みを3倍にしてある。**学習済みモデルではない**）。学習済みの重みは Step 3 で `plugin/Source/nn/EmbeddedWeights.h` としてコミットする。
+* **生成元**: Step 3 で学習済みの重みができるまでは、`training/export_weights.py --random-test` がビルド時に `<build>/generated/nn/EmbeddedWeights.h` を生成する（固定の試験用重み。seed 42 の疑似乱数で、スケールは第3.1節の初期化に合わせ、全バイアスと LayerNorm 係数を非ゼロ、ヘッドの重みを3倍にしてある。**学習済みモデルではない**）。学習済みの重みは**公開リポジトリには入れず**、手元でビルド時に `plugin/Source/nn/EmbeddedWeights.h` として差し込む（`.gitignore` 対象）。リポジトリに入れるのは生成の仕組み（`training/export_weights.py`）までとする。
 * **読み込み時の検査**: `.swmodel` はサイズ `671,616 bytes`・Magic・Header の6項目・CRC32 をすべて確認してから使う（`model::checkFile`）。
 * **Header（64 bytes 固定・Little Endian、`0x00 .. 0x3F`）**:
   * `0x00..0x07`: Magic `"SWZFB004"`
@@ -427,7 +431,7 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
   * 話者ID・楽曲ID単位で重複なし **Train `80%` / Val `10%` / Test `10%`** へ分割し、`manifest.json` へ固定記録する。
   * 乱数Seedは `seed = 42` で固定（PyTorch / NumPy / Python `random` / DataLoader worker）。
   * Checkpoint 選択規則: 2,000 steps ごとに Val セット全チャンクの総損失を評価し、最小値更新時のみ `best.pt` を保存する。
-* **ライセンス監査ルール**: `training/prepare_data.py` は各ソースのライセンス種別を `manifest.json` へ必須記録する。Step 3B の商用配布モデル学習時は、商用利用・派生モデル配布が許可されたデータ（CC0 / CC-BY / 許諾済みデータ）のみを `--commercial-only` フィルタで抽出する。
+* **ライセンス監査ルール**: `training/prepare_data.py` は各ソースのライセンス種別を `manifest.json` へ必須記録する。Step 3B の商用配布モデル学習時は、商用利用・派生モデル配布が許可されたデータ（CC0 / CC-BY / 許諾済みデータ）のみを `--commercial-only` フィルタで抽出する。**非商用データ（CC BY-NC 等）を含む重みは個人利用専用とし、公開・配布しない（公開リポジトリにも入れない）。**
 
 ### 4.3 2段階学習プロトコル・微分可能EQプロキシ・厳密MR-STFT損失
 * **Optimizer**: `AdamW`（`lr=1e-3`, `weight_decay=1e-4`, `betas=(0.9, 0.999)`）、Cosine Annealing（下限 `1e-5`）、勾配クリップ `max_norm=1.0`、Batch Size `32`。
@@ -774,7 +778,7 @@ zero-fb-suppressor/
     │   ├── nn/
     │   │   ├── SimdKernels.h        # NEON / AVX2 Row-Major GEMV・Conv1D・LayerNorm・GRU
     │   │   ├── CausalGruEngine.h    # ゼロアロケーション推論エンジン（192in -> 64out）
-    │   │   └── EmbeddedWeights.h    # static constexpr alignas(64) 共有重み配列
+    │   │   └── EmbeddedWeights.h    # static constexpr alignas(64) 共有重み配列（学習済みは非公開。ビルド時に生成・差し込み）
     │   └── ui/
     │       ├── CustomLookAndFeel.h  # ジオメトリックノブ・メーター・UX操作実装
     │       └── GrAnalyzerView.h     # 32バンドリアルタイムGRキャンバス
