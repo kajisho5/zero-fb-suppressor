@@ -4,6 +4,8 @@
 // allocation, gain-coupling accuracy, the fail-safe guard and the FSM.
 
 #include "TestUtil.h"
+#include "../Source/nn/CausalGruEngine.h"
+#include "nn/EmbeddedWeights.h" // generated: fixed test weights, not a trained model
 
 #include <atomic>
 #include <cmath>
@@ -193,6 +195,72 @@ void testBlockSizeIndependence()
             }
         ZFB_CHECK_MSG(maxDiff < 1.0e-6, fmt("fs=%.0f max diff %.3e", fs, maxDiff));
         ZFB_CHECK(energy > 1.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+void testNeuralEngineInTheLoop()
+{
+    section("neural engine attached: block sizes and zero heap allocation");
+    const int blockSizes[] = { 1, 7, 16, 31, 64, 5000 };
+    for (double fs : kRates)
+    {
+        const size_t total = size_t(fs * 2.0);
+        Noise noise;
+        std::vector<float> in[2], ref[2], out[2];
+        for (int c = 0; c < 2; ++c)
+        {
+            in[c].resize(total);
+            for (size_t n = 0; n < total; ++n)
+                in[c][n] = 0.1f * noise.next() * float(0.5 + 0.5 * std::sin(2.0 * kPi * 3.0 * double(n) / fs))
+                         + 0.2f * float(std::sin(2.0 * kPi * 2150.0 * double(n) / fs + c));
+            ref[c].assign(total, 0.0f);
+            out[c] = in[c];
+        }
+
+        auto netRef = std::make_unique<CausalGruEngine>(embedded::kWeights);
+        auto net = std::make_unique<CausalGruEngine>(embedded::kWeights);
+        auto reference = std::make_unique<ZeroFbEngine>();
+        auto engine = std::make_unique<ZeroFbEngine>();
+        reference->setEstimator(netRef.get());
+        engine->setEstimator(net.get());
+        reference->prepare(fs, 2);
+        engine->prepare(fs, 2);
+        EngineParams p;
+        p.suppress = 1.0f;
+        p.dereverb = 1.0f;
+        reference->setParams(p);
+        engine->setParams(p);
+
+        const long before = gAllocations.load();
+        run(*reference, in, ref, 2, 0, total, 1);
+        size_t pos = 0;
+        int index = 0;
+        while (pos < total)
+        {
+            const size_t n = std::min<size_t>(size_t(blockSizes[index % 6]), total - pos);
+            run(*engine, out, out, 2, pos, pos + n, int(n));
+            pos += n;
+            ++index;
+        }
+        const long after = gAllocations.load();
+        ZFB_CHECK_MSG(after == before, fmt("heap allocations inside process: %.0f", double(after - before)));
+
+        double maxDiff = 0.0;
+        bool finite = true, changed = false;
+        for (int c = 0; c < 2; ++c)
+            for (size_t n = 0; n < total; ++n)
+            {
+                maxDiff = std::max(maxDiff, double(std::abs(out[c][n] - ref[c][n])));
+                finite = finite && std::isfinite(out[c][n]);
+                changed = changed || out[c][n] != in[c][n];
+            }
+        ZFB_CHECK_MSG(maxDiff < 1.0e-6, fmt("fs=%.0f max diff %.3e", fs, maxDiff));
+        ZFB_CHECK(finite && changed);
+        float minGain = 0.0f;
+        for (int b = 0; b < kNumBands; ++b)
+            minGain = std::min(minGain, engine->bandGainsDb()[b]);
+        ZFB_CHECK_MSG(minGain < -0.5f, fmt("the network output reaches the EQ (min gain %.2f dB)", minGain));
     }
 }
 
@@ -644,6 +712,7 @@ int main()
 {
     testBitPerfectBypass();
     testBlockSizeIndependence();
+    testNeuralEngineInTheLoop();
     testZeroLatencyAndNoPreRinging();
     testGainCoupling();
     testFailsafe();

@@ -1,4 +1,4 @@
-# ZERO-FB: Zero-Latency AI Feedback & Dereverb Suppressor 単一正本設計書（SPEC.md v1.5）
+# ZERO-FB: Zero-Latency AI Feedback & Dereverb Suppressor 単一正本設計書（SPEC.md v1.6）
 
 > **実装エージェント（Claude / Claude Code）および仕様監査役への宣言:**
 > 本書は、過去の分冊（v1.2 / 補遺04 / 補完リスト05 / v1.3）および10世代プローブ・監査指摘事項をすべて統合し、すべての数式・状態遷移・バイナリ配置・受入試験プロトコルを1択へ確定させた**唯一の単一正本（Single Source of Truth）**である。
@@ -6,9 +6,17 @@
 > 実装は「第9章：実装マイルストーン（Step 1 〜 Step 4）」の順に実施し、各ステップの自動テストがすべて合格してから次へ進むこと。
 
 ### バージョン番号の読み方
-* **設計書のバージョン**: 本書は `SPEC v1.5`。これは文書の番号であり、ソフトの番号ではない。
+* **設計書のバージョン**: 本書は `SPEC v1.6`。これは文書の番号であり、ソフトの番号ではない。
 * **ソフトのバージョン**: 最初のリリースは **`v0.1.0`**（本書の実装対象）。狭帯域ノッチ（Stage 6B）を足すリリースは **`v0.2.0`**。
 * **保存データ・重みファイルの番号**: `state_version="1"` と Magic `"SWZFB004"` はそれぞれ独立した形式番号で、ソフトのバージョンとは連動しない。
+
+### v1.5 からの変更点（Step 2 実装時の検証で確定）
+1. **第3.1節・第5章 FMA の扱い**: NN の内積（GEMV・Conv1d・LayerNorm の分散）に限り、明示的な積和融合命令を使ってよい。DSP 経路（第2章）は従来どおり使わない。
+2. **第3.2節 `EmbeddedWeights.h`**: 学習済みの重みができる Step 3 までは、固定の試験用重み（seed 42 の疑似乱数。学習済みモデルではない）からビルド時に生成する。
+3. **第5.2節 信号パスの SIMD 化**: 見送り。DSP 全体（推論なし）で 1 コールバックの中央値がブロック予算の `1.75%` と十分小さかったため（Xeon 2.1 GHz での実測）。
+4. **第7.1節 閉ループベンチ**: 仮想会場の合成式、発散限界の理論値との照合、ハンチング・モードホッピングの数え方を確定。Step 2 の刺激音声は合成の疑似発話。
+5. **第7.2節 NN の誤差基準**: 実測にもとづき数値を確定。
+6. **第2.5節 未解決の課題を追記**: 純音の Ring Index は周波数によって `2.7〜10.8 dB` しか出ず、`+6 dB` を超えるのは全周波数の約半分。バックオフ延長条件（`T_raw > 6 dB`）は見直しが必要（Step 3 で学習済みモデルと合わせて決める）。
 
 ### v1.4 からの変更点（Step 1 実装時の検証で確定）
 1. **第2.5節 FSM**: Hold 開始時に `since_hold_end` を 0 にしていたため、1回のハウリングの中で約 1 ms のうちにバックオフがレベル2（12秒）まで上がる不具合を修正。バックオフ段階は「Hold に入る瞬間」に1回だけ判定する。
@@ -43,6 +51,7 @@
 | **Windows 11** | `x86_64` | `VST3` | MSVC 2022 (`v143`, `/O2 /arch:AVX2`) | `ZeroLatencyTest`, `GoldenParityTest`, `ClosedLoopBench`, `pluginval` (L8) |
 
 * **CPU / xrun 基準マシン**: Apple M4 系（macOS `arm64`, Release ビルド, `48 kHz / 16 samples / Stereo`）で単一オーディオコールバック時間の対ブロック予算比 **中央値 `<= 10%`・P99 `<= 15%`**（warm-up 10秒後、60秒間計測）。
+* **Step 2 時点の CPU 実測（参考値。基準マシンではない）**: `EngineBench`（48 kHz / 16 samples / Stereo、warm-up 10秒後に計測、固定の試験用重み）で、Intel Xeon 2.1 GHz の仮想マシン（AVX2）が DSP のみ 中央値 `1.75%`・P99 `5.0%`、DSP＋NN 推論 中央値 `4.1%`・P99 `8.3%`。Apple M4 系での実測は未実施。
 
 ---
 
@@ -187,6 +196,7 @@ Output y_L[n], y_R[n]
   $$F_{\text{lin}} = 10^{\text{Floor}_{\text{dB}} / 20.0},\quad m_{\text{comb}}[b] = m_{\text{fb}}[b]\cdot\big(1 - D\cdot(1 - m_{\text{rev}}[b])\big)$$
   $$M_{\text{target}}[b] = \max\!\big(F_{\text{lin}},\; 1 - S\cdot(1 - m_{\text{comb}}[b])\big)$$
 * **優先順位**: `FAILSAFE_MUTE > RESET > ATTACK > VOICE_OVERRIDE > HOLD > SLOW_RELEASE > NORMAL_RELEASE`
+* **未解決の課題（Ring Index のしきい値）**: 定常の純音を入れたときの $T^{\text{raw}}$ の最大値（全バンド中）は、音がバンド中心にあるとき `6.9〜11.4 dB`、2つのバンド中心の間にあるときは最小 `2.7 dB` まで下がる（解析応答による計算、48 kHz）。`+6 dB` を超えるのは 70 Hz〜13 kHz の周波数の `52%`。したがって下の擬似コードの「再発かつ `T_raw > 6 dB`」という延長条件は、ハウリング周波数の約半分でしか成立しない。対策候補は (a) しきい値を下げる、(b) 隣接2バンドの大きい方を自バンドとみなして突出度を取る、(c) 延長条件から Ring を外し Head A の深さだけで判定する。どれを採るかは Step 3 で学習済みモデルの挙動と合わせて決め、それまでは v1.5 のまま動かす。
 * **ホップ境界 $k$ ごとの単一状態更新アルゴリズム（単位: 時間はすべてフレーム数、1フレーム $\Delta t = H / f_s$）**:
 
 ```cpp
@@ -323,7 +333,7 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
 
 ## 3. ニューラルネットワーク厳密仕様 & バイナリ重み規範表
 
-汎用推論ランタイム（ONNX Runtime / LibTorch 等）は禁止とし、C++ / SIMD（NEON / AVX2）で直接実装する。
+汎用推論ランタイム（ONNX Runtime / LibTorch 等）は禁止とし、C++ / SIMD（NEON / AVX2）で直接実装する（`plugin/Source/nn/SimdKernels.h`, `CausalGruEngine.h`）。重みが未設定のときは全マスク `1.0`（抑制なし）を返す。
 
 ### 3.1 層構成・演算規約・厳密計算量
 | 層 | 種別 | 入力 → 出力 | 厳密演算仕様（PyTorch 完全準拠） | パラメータ数 |
@@ -345,7 +355,9 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
   * `48 kHz / H=16` (`3,000 Hz`): **`1.109 GFLOPs/sec`** ／ `44.1 kHz / H=15` (`2,940 Hz`): **`1.087 GFLOPs/sec`** ／ `96 kHz / H=32` (`3,000 Hz`): **`1.109 GFLOPs/sec`**。
 
 ### 3.2 バイナリ重みフォーマット（`.swmodel` / `EmbeddedWeights.h`）規範レイアウト
-* **共有メモリ規約**: `EmbeddedWeights` は `static constexpr alignas(64) float[]` としてプロセス内全インスタンスで **Read-Only 1コピー共有**し、マルチインスタンス時の L2 キャッシュ溢れを防止する。
+* **共有メモリ規約**: `EmbeddedWeights` は `alignas(64) inline constexpr float[]`（名前空間 `zerofb::embedded`、`kWeights` / `kWeightCount` / `kPayloadCrc32`）としてプロセス内全インスタンスで **Read-Only 1コピー共有**し、マルチインスタンス時の L2 キャッシュ溢れを防止する。各値は16進浮動小数点リテラルで書き出し、`.swmodel` の Payload とビット単位で一致させる。
+* **生成元**: Step 3 で学習済みの重みができるまでは、`training/export_weights.py --random-test` がビルド時に `<build>/generated/nn/EmbeddedWeights.h` を生成する（固定の試験用重み。seed 42 の疑似乱数で、スケールは第3.1節の初期化に合わせ、全バイアスと LayerNorm 係数を非ゼロ、ヘッドの重みを3倍にしてある。**学習済みモデルではない**）。学習済みの重みは Step 3 で `plugin/Source/nn/EmbeddedWeights.h` としてコミットする。
+* **読み込み時の検査**: `.swmodel` はサイズ `671,616 bytes`・Magic・Header の6項目・CRC32 をすべて確認してから使う（`model::checkFile`）。
 * **Header（64 bytes 固定・Little Endian、`0x00 .. 0x3F`）**:
   * `0x00..0x07`: Magic `"SWZFB004"`
   * `0x08..0x0B`: `uint32_t sample_rate_ref` (`48000`)
@@ -438,7 +450,8 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
 1. **ゼロアロケーション・ロックフリー証明**: `processBlock` 内のヒープ確保・ロック・システムコールを禁止し、`juce::ScopedNoDenormals` を先頭配置。テストビルドではグローバル `operator new` フックにより `processBlock` 内の割当回数が厳密に **`0`** であることを自動検証する。
 2. **SIMD 並列化（NEON / AVX2）**:
    * **サイドチェイン（32バンド × 1〜2ch）**: SoA（Structure of Arrays）メモリ配置とし、NEON（4バンド並列 `float32x4_t`）/ AVX2（8バンド並列 `__m256`）で常時更新。
-   * **信号パス（直列32バンド × 1〜2ch）**: L/R 2チャンネルを SIMD レーンで同時演算（常時稼働・スキップなし）。
+   * **信号パス（直列32バンド × 1〜2ch）**: 全バンド常時稼働・スキップなし。L/R の SIMD 同時演算は行わずスカラーで実装する（DSP 全体で中央値 `1.75%` と予算に対して十分小さく、複雑にする理由がないため。CPU が不足した場合のみ再検討する）。
+   * **NN 推論**: GEMV は4行同時・行ベクトル内積、Conv1d は帯域方向に並列。内積に限り FMA（`_mm256_fmadd_ps` / `vfmaq_f32`）を使う。SIMD 幅で加算順が変わるため、NN の出力は参照とビット一致ではなく第7.2節の許容誤差で照合する。活性化関数（Sigmoid / Tanh / SiLU）の SIMD 実装は `FastMath.h` のスカラー関数と同じ演算列で、結果もビット一致させる。
 3. **高速超越関数**: `fast_log10` / `fast_exp2` / Padé `fast_tanh` / `fast_sigmoid` を使用し、単体テストで `std::` 標準関数比の最大絶対誤差 **`< 1e-5`**（動作ドメイン内）を検証する。
    * 動作ドメイン: `fast_log10` は `[1e-10, 1e3]`、`fast_exp2` は `[-30, 4]`、`fast_tanh` / `fast_sigmoid` は有限の全入力。
    * `fast_exp2(0) == 1`、`fast_log10(1) == 0` は厳密に成り立つこと（0 dB のとき Stage 6A が完全に素通しになる条件）。
@@ -657,24 +670,35 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
 ### 7.1 閉ループ自動ベンチマーク（`plugin/tests/ClosedLoopBench.cpp`）
 仮想音響ループ内に `ZERO-FB` を直列挿入して計測する：
 $$x_{\text{mic}}[n] = s_{\text{voice}}[n] + G \cdot (h_{\text{room}} * y_{\text{plugin}})[n - D]$$
-* **決定論的ベンチ条件（seed = 42）**:
+* **決定論的ベンチ条件（seed = 42、`48 kHz` モノラル、1回 10秒）**:
+  * **RIR の合成式**: 長さ `RT60 × fs` サンプル。拡散成分 $h_d[n] = \mathcal{N}(0,1)\cdot 10^{-3 n / (\text{RT60}\cdot f_s)}$ に、主要共振3つ $a_i\,e^{-n/\tau_i}\sin(2\pi f_i n / f_s + \phi_i)$（$\tau_i = Q f_s / (\pi f_i)$）を加える。共振のピークは拡散成分のスペクトル RMS に対して `+14 / +12.5 / +11 dB`（第1〜第3共振）。最後に、応答の最大振幅が `0 dB` になるよう全体を正規化する。
+  * **発散限界の理論値**: バイパス時のループ応答 $G\cdot H(f)e^{-j\omega D}$ の位相が $2\pi$ の整数倍になる周波数のうち実部が最大の点から $G_0$ を予測し、探索で求めた $G_0$ と照合する（合格基準: 実測が予測の `-0.5 〜 +1.5 dB` 以内。3会場とも実測と予測は一致した）。
+  * **畳み込み**: ループ遅延 $D$ があるので、128 サンプル単位の分割 FFT 畳み込みで計算する（直接畳み込みとの一致を毎回検査）。
   * 仮想会場 RIR 3種（指数減衰ガウスノイズ＋主要共振3極の合成 RIR）:
     1. `Room_Small`: `RT60 = 0.6 s`, $D = 240\text{ smp}$ (`5 ms`), 主共振 `{420, 1850, 3900} Hz` ($Q = 30$)
     2. `Room_Hall`: `RT60 = 1.2 s`, $D = 576\text{ smp}$ (`12 ms`), 主共振 `{280, 1250, 2600} Hz` ($Q = 45$)
     3. `Room_Large`: `RT60 = 2.0 s`, $D = 1200\text{ smp}$ (`25 ms`), 主共振 `{190, 920, 2150} Hz` ($Q = 60$)
   * 刺激音声 $s_{\text{voice}}[n]$: Val/Test スピーチ（RMS `-24 dBFS`、発話 2秒／休止 1秒の反復 10秒）。
+  * **Step 2 での刺激音声**: 学習データがまだ無いため、合成の疑似発話（基本周波数 約118 Hz の倍音列にフォルマント3つ、3.7 Hz の音節包絡、息ノイズ）を使う。Step 3 で Val/Test スピーチへ差し替える。
 * **計測および採点手順**:
   1. **発散判定**: 出力 $y_{\text{plugin}}$ の 50 ms 移動 RMS が `-3.0 dBFS` を `100 ms` 連続超過、または休止区間の出力 RMS が刺激平均 RMS を `+6.0 dB` 超過した場合を発散と判定する。
   2. **$G_0$ 探索**: `BYPASS = ON` 状態で二分探索（精度 `0.25 dB`）により発散限界ゲイン $G_0$ を求める。
   3. **GBF 計測**: `ZERO-FB` 有効時（`SUPPRESS=75%, DEREVERB=50%, FLOOR=-24dB, SPEECH`）に $G_0$ から `+0.5 dB` 刻みで 10秒稼働させ、非発散最大ゲイン $G_{\max}$ から $\text{GBF} = G_{\max} - G_0$ を算出（合格基準: **3会場平均 `+6.0 dB` 以上**）。
   4. **ハンチング（バースト）判定**: $G = G_0 + 4.0\text{ dB}$ 固定で 10秒連続稼働させ、一度抑制された帯域の 50 ms 移動パワーが休止区間中に `+10 dB` 以上再上昇する事象をカウント（合格基準: **0 回**）。
   5. **モードホッピング収束**: 第1共振の抑制後に第2共振が `-20 dBFS` を超えて立ち上がってから `-30 dBFS` 以下へ沈むまでの時間を計測（合格基準: **`50 ms` 以内**）。
+* **数え方の確定（実装）**:
+  * 発散判定 2 の「休止区間の出力 RMS」は休止 1秒ぶん全体で評価する。出力が非有限、または絶対値 `64` 超も発散とする（バイパス時の暴走打ち切り）。
+  * ハンチングは、プラグイン出力を第2.4節と同じ32バンドで観測し、「それまでに EQ ゲインが `-3 dB` 未満になったことがある帯域」について、休止区間内の 50 ms 移動パワーがその休止での最小値から `+10 dB` 以上（かつ `-60 dBFS` 超）へ上がった回数を数える。最小値 `+3 dB` 未満へ戻ったら次の1回を数えられる状態に戻す。
+  * モードホッピングは、3つの共振にもっとも近い帯域を対象とし、「別の共振の帯域がすでに抑制された後」にその帯域が `-20 dBFS` を超えてから `-30 dBFS` 未満へ沈むまでの時間の最大値とする。10秒の終わりまで沈まなければ「未収束」。
+* **Step 2 の位置づけ（骨格）**: 学習済みモデルが無いので GBF・ハンチング・ホッピングの値は参考表示のみ。合否にするのはベンチ自身の正しさ（畳み込みの一致、$G_0$ の理論値との一致、全マスク `1.0` のとき GBF が `±0.5 dB` 以内で EQ が動かないこと）。
+* **Step 2 の参考値**: 全マスク `1.0` で GBF `0.0 dB`（3会場とも）。試験用のルールベース推定器（Ring `> 4 dB`・変調度 `< 6 dB`・長期レベル超の帯域を `0.1` にするだけのもの。製品には入らない）で3会場平均 GBF `+3.0 dB`。FSM と EQ が閉ループで働くことの確認であり、性能値ではない。
 
 ### 7.2 ゴールデンパリティ & 単体自動テスト仕様
 1. **独立 NumPy 参照による Golden Fixture 生成**:
    * `training/gen_golden_fixtures.py` が固定 seed `42` の決定論的 5秒テスト信号（インパルス＋チャープ＋疑似発話＋2kHzトーン（L/R 逆相）＋無音。`44.1 / 48 / 96 kHz` のステレオ3種と `48 kHz` モノラル1種）を生成し、**C++ とコードを共有しない純 Python/NumPy 参照実装**（`training/erb_dsp.py`）を float64 と float32 の両方で実行して期待出力と SHA-256 マニフェスト（`sha256.txt`）を書き出す。
-   * 生成物は約 `140 MB` あるためリポジトリには入れず、**ビルド時に毎回生成する**（CMake のカスタムコマンド）。
-   * Step 1 の対象は特徴量 `(T, 6, 32)` と影響率行列・Projected Gauss-Seidel。固定ランダム重み `.swmodel`、中間層 `conv1/proj/gru1/gru2`、出力マスク `(T, 64)`、MR-STFT 損失値は Step 2 で同じ生成スクリプトへ追加する。
+   * 生成物は約 `200 MB` あるためリポジトリには入れず、**ビルド時に毎回生成する**（CMake のカスタムコマンド。所要 約1分）。
+   * Step 1 の対象は特徴量 `(T, 6, 32)` と影響率行列・Projected Gauss-Seidel。Step 2 で、固定の試験用重み `test_model.swmodel`、全フレームの出力マスク `(T, 64)`（4ケース）、先頭 2,000 フレームの全層出力（`conv1` 512＋`proj` 96＋`gru1` 96＋`gru2` 96＋マスク 64 ＝ 864 値、`48 kHz` ステレオ）を追加した。MR-STFT 損失値は Step 3 で `losses.py` と一緒に追加する。
+   * NN の NumPy 参照（`training/nn_reference.py`）は PyTorch の `training/model.py` と float64 で `3.3e-16` まで一致することを確認済み（同じ重み・同じ入力 3,000 フレーム）。
    * **合格基準（$L_\infty$ ノルム最大絶対誤差。特徴量はスケーリング後の値）**:
      * 高速近似関数単体（`fast_log10 / fast_exp2 / fast_tanh / fast_sigmoid` vs `std::`）: **`< 1e-5`**
      * Python float32 参照 vs float64 参照: **`< 1e-3`**（単精度そのものの丸め限界。実測 `1.4e-4 〜 1.7e-4`）
@@ -683,7 +707,13 @@ $$x_{\text{mic}}[n] = s_{\text{voice}}[n] + G \cdot (h_{\text{room}} * y_{\text{
      * C++（両ビルド）vs float64 参照: **`< 1e-3`**
      * 影響率行列 vs 参照: **`< 1e-6`**、Projected Gauss-Seidel の解 vs 参照: **`< 1e-3 dB`**
    * 特徴量の照合は「解析器単体」「エンジン経由（1ホップを不均等な2ブロックに分割）」「エンジン経由（バイパス中）」の3通りで行い、ホップ境界 $n_k = (k+1)H - 1$ とバイパス中の制御経路の継続を同時に確認する。
-   * Step 2 で追加する中間層・64ch マスクの許容誤差も同じ3段構成とし、数値は Step 2 着手時に実測して本書へ追記する（GRU は誤差が時間方向に積み重なるため、Step 1 の数値をそのまま流用しない）。
+   * **NN の合格基準（固定の試験用重みでの値。Step 2 で実測して確定）**:
+     * Python float32 参照 vs float64 参照（マスク）: **`< 1e-4`**（実測 `3.9e-6 〜 9.2e-6`）
+     * C++（全ビルド・全経路）の各層出力 vs Python float32 参照: **`< 2e-5`**（実測 最大 `4.1e-6`）
+     * C++ の各層出力 vs float64 参照: **`< 1e-4`**（実測 最大 `2.6e-5`、LayerNorm 直後の `proj` 層）
+     * 音声 → C++ 特徴量 → C++ NN の通しで得たマスク vs 参照（float32・float64 とも）: **`< 1e-4`**（実測 最大 `9.2e-6`）
+     * SIMD の活性化関数 vs スカラーの `fast_tanh` / `fast_sigmoid`: **ビット完全一致**
+     * 試験用重みは誤差が時間方向に増幅しない性質だった（5秒・15,000 フレームで上の値）。学習済みの重みで同じとは限らないので、Step 3 で重みを差し替えたら数値を測り直す。
 2. **`ZeroLatencyTest.cpp`**:
    * `SUPPRESS = 0%` および `BYPASS = ON`（5 ms 遷移完了後）でのサンプル単位ビット完全一致（最大絶対誤差 `0.0`）。
    * 変則ブロック長（`1, 7, 16, 31, 64, 5000 samples`）切替時に出力が 1サンプル単位処理と完全一致（誤差 `< 1e-6`）かつヒープ確保 `0`（`operator new` フック検証）。
@@ -708,7 +738,7 @@ zero-fb-suppressor/
 ├── scripts/
 │   └── package_macos.sh             # codesign + notarytool 公証 + .pkg 生成
 ├── docs/
-│   ├── SPEC.md                      # 本単一正本設計書（v1.5）
+│   ├── SPEC.md                      # 本単一正本設計書（v1.6）
 │   ├── SIMD.md                      # SIMD最適化の実装指針（本書が優先）
 │   └── ui_master.svg                # 720x380 SVGデザインマスター（XMLパース検査対象）
 ├── training/
@@ -717,6 +747,7 @@ zero-fb-suppressor/
 │   ├── loop_simulator.py            # 開ループ物理フィードバック合成 + 2ヘッドIRM + 擬似閉ループ
 │   ├── erb_dsp.py                   # C++側と式・定数完全一致のPython実装（PGS補正含む）
 │   ├── model.py                     # Causal Conv(6->16) + 2-Layer GRU (167,888 params, 64ch)
+│   ├── nn_reference.py              # NN の NumPy 参照実装（C++・PyTorch とコードを共有しない）
 │   ├── losses.py                    # Mask-L1 / FB-Penalty / Smooth / 微分可能STFT-EQ MR-STFT
 │   ├── train.py                     # Step 3A (PoC 10k) / Step 3B (Stage A 100k + Stage B 20k)
 │   └── export_weights.py            # .swmodel (671,616B, CRC32) + EmbeddedWeights.h 出力
@@ -745,7 +776,8 @@ zero-fb-suppressor/
         │                            # （Golden Fixture はビルドフォルダへ生成。リポジトリには入れない）
         ├── ZeroLatencyTest.cpp      # Bit-perfect / 0smp / PGS均一・単一 / 変則BLK / NaN / Heap=0
         ├── GoldenParityTest.cpp     # 近似関数単体 + 3SR特徴量・行列・PGS vs NumPy参照（第7.2節の基準）
-        └── ClosedLoopBench.cpp      # 3仮想会場 GBF(+6dB) / ハンチング(0回) / ホッピング(50ms)
+        ├── EngineBench.cpp          # 1コールバックのCPU負荷計測（中央値・P99。参考表示）
+        └── ClosedLoopBench.cpp      # 3仮想会場 GBF / ハンチング / ホッピング（Step 2 は骨格。第7.1節）
 ```
 
 ---
@@ -759,6 +791,7 @@ zero-fb-suppressor/
 * **Step 2（SIMD推論エンジン＆閉ループベンチ骨格）**:
   * `SimdKernels.h`, `CausalGruEngine.h`, `EmbeddedWeights.h`（ダミー重み生成含む）, `training/model.py`, `training/export_weights.py`, `ClosedLoopBench.cpp` を実装する。
   * **完了条件**: `.swmodel` バイト長 `671,616 bytes` & CRC32 一致、中間層・64ch 出力が第7.2節の3段基準内（数値は着手時に実測して確定）、Apple M4 系 `48 kHz / 16 smp / Stereo` での CPU 負荷 中央値 `<= 10%`・P99 `<= 15%`・ヒープ確保 `0 bytes` を達成すること。
+  * **状態**: 実装とテストは完了。`.swmodel` 671,616 bytes・CRC32 一致、各層と 64ch マスクが第7.2節の基準内、NN を接続した状態でヒープ確保 0 を Linux（AVX2）・macOS（NEON）・Windows（AVX2）で確認。**CPU 負荷の完了条件だけは Apple M4 系の実機が無いため未確認**（参考値は第1.2節）。
 * **Step 3（段階的モデル学習＆実機組み込み）**:
   * **Step 3A（ミニPoC）**: 2時間スピーチ＋開ループ合成で `10k steps` 学習 → `EmbeddedWeights.h` 出力 → `ClosedLoopBench` でエンドツーエンドの GBF 向上とハンチング抑制を確認。
   * **Step 3B（本番学習）**: ライセンス監査済み 200時間相当フルセットで Stage A（`100k steps`）＋ Stage B（微分可能 STFT-EQ プロキシ `20k steps`）を学習し、GBF（3会場平均 `+6.0 dB` 以上）・ハンチング `0 回`・ホッピング `<= 50 ms`・レベル不変性（`±2.0 dB`）・STOI 劣化 `< 0.02`・BGM後解放 `<= 20 ms` をすべて満たす重みを確定する。

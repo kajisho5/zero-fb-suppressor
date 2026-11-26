@@ -6,6 +6,8 @@
 // Usage: GoldenParityTest FIXTURE_DIR
 
 #include "TestUtil.h"
+#include "../Source/nn/CausalGruEngine.h"
+#include "nn/EmbeddedWeights.h" // generated: fixed test weights, not a trained model
 
 #include <cstring>
 #include <fstream>
@@ -29,6 +31,15 @@ constexpr double kToleranceVsFloat32 = 1.0e-4;
 #endif
 constexpr double kToleranceVsFloat64 = 1.0e-3;
 constexpr double kFastMathTolerance = 1.0e-5;
+
+// Network outputs with the fixed test weights (layer outputs and masks).
+// The SIMD dot products sum in a different order than NumPy, so even the
+// exact-math build is compared at a tolerance. Measured: <= 4.1e-6 against
+// the float32 reference and <= 2.6e-5 against float64 (SPEC 7.2).
+constexpr double kNetToleranceVsFloat32 = 2.0e-5;
+constexpr double kNetToleranceVsFloat64 = 1.0e-4;
+// Masks computed end to end (C++ features into the C++ network).
+constexpr double kMaskToleranceEndToEnd = 1.0e-4;
 
 template <typename T>
 std::vector<T> readFile(const std::string& path)
@@ -226,6 +237,197 @@ void testCoupling(const std::string& dir)
     }
 }
 
+void testVectorActivations()
+{
+    section("SIMD activations are bit-identical to the scalar fast functions");
+    using simd::Vec;
+    bool same = true;
+    float in[8], outT[8], outS[8];
+    for (int i = 0; i <= 400000; ++i)
+    {
+        const float x = -25.0f + 50.0f * float(i) / 400000.0f;
+        for (int k = 0; k < 8; ++k)
+            in[k] = x + float(k) * 1.0e-4f;
+        for (int k = 0; k < 8; k += Vec::width)
+        {
+            simd::fastTanh(Vec::load(in + k)).store(outT + k);
+            simd::fastSigmoid(Vec::load(in + k)).store(outS + k);
+        }
+        for (int k = 0; k < 8; ++k)
+            same = same && outT[k] == fast_tanh(in[k]) && outS[k] == fast_sigmoid(in[k]);
+    }
+    ZFB_CHECK(same);
+}
+
+/** Loads a .swmodel into float-aligned storage. */
+std::vector<float> loadModel(const std::string& path, model::FileStatus& status)
+{
+    const auto bytes = readFile<unsigned char>(path);
+    std::vector<float> storage((bytes.size() + 3) / 4);
+    if (! bytes.empty())
+        std::memcpy(storage.data(), bytes.data(), bytes.size());
+    status = model::checkFile(storage.data(), bytes.size());
+    return storage;
+}
+
+void testModelFile(const std::string& dir)
+{
+    section(".swmodel container (671,616 bytes, CRC32) and embedded weights");
+    model::FileStatus status;
+    auto file = loadModel(dir + "/test_model.swmodel", status);
+    ZFB_CHECK(file.size() * 4 == model::kFileBytes);
+    ZFB_CHECK(status == model::FileStatus::ok);
+    if (status != model::FileStatus::ok)
+        return;
+
+    auto* bytes = reinterpret_cast<unsigned char*>(file.data());
+    ZFB_CHECK(model::crc32(reinterpret_cast<const unsigned char*>("123456789"), 9) == 0xCBF43926u); // standard check value
+    ZFB_CHECK(model::checkFile(bytes, model::kFileBytes - 1) == model::FileStatus::wrongSize);
+    bytes[model::kHeaderBytes + 1000] ^= 0x01;
+    ZFB_CHECK(model::checkFile(bytes, model::kFileBytes) == model::FileStatus::wrongCrc);
+    bytes[model::kHeaderBytes + 1000] ^= 0x01;
+    bytes[0] = 'X';
+    ZFB_CHECK(model::checkFile(bytes, model::kFileBytes) == model::FileStatus::wrongMagic);
+    bytes[0] = 'S';
+    bytes[0x18] ^= 0x01; // hidden_size
+    ZFB_CHECK(model::checkFile(bytes, model::kFileBytes) == model::FileStatus::wrongHeader);
+    bytes[0x18] ^= 0x01;
+    ZFB_CHECK(model::checkFile(bytes, model::kFileBytes) == model::FileStatus::ok);
+
+    // The generated header carries exactly the payload of the file.
+    ZFB_CHECK(embedded::kWeightCount == model::kTotalParams);
+    ZFB_CHECK(embedded::kPayloadCrc32 == model::readU32(bytes + 0x20));
+    ZFB_CHECK(std::memcmp(embedded::kWeights, bytes + model::kHeaderBytes, size_t(model::kTotalParams) * 4) == 0);
+    ZFB_CHECK(reinterpret_cast<std::uintptr_t>(embedded::kWeights) % 64 == 0);
+}
+
+struct LayerErrors { double e32 = 0.0, e64 = 0.0; };
+
+void testNetworkLayers(const std::string& dir)
+{
+    section("network layers vs NumPy reference (reference features as input)");
+    const auto feat = readFile<float>(dir + "/features_48000_stereo.f32");
+    const auto ref32 = readFile<float>(dir + "/nn_layers_48000_stereo.f32");
+    const auto ref64 = readFile<double>(dir + "/nn_layers_48000_stereo.f64");
+    constexpr int kLayerTotal = model::kConvOut + 3 * model::kHidden + kMaskSize; // 864
+    const size_t frames = ref32.size() / size_t(kLayerTotal);
+    ZFB_CHECK(frames >= 1000 && ref64.size() == ref32.size() && feat.size() >= frames * size_t(kFeatureSize));
+    if (frames == 0 || ref64.size() != ref32.size())
+        return;
+
+    auto net = std::make_unique<CausalGruEngine>(embedded::kWeights);
+    const char* names[5] = { "conv1", "proj", "gru1", "gru2", "masks" };
+    const int sizes[5] = { model::kConvOut, model::kHidden, model::kHidden, model::kHidden, kMaskSize };
+    LayerErrors err[5];
+    float masks[kMaskSize];
+    for (size_t k = 0; k < frames; ++k)
+    {
+        net->infer(feat.data() + k * size_t(kFeatureSize), masks);
+        const float* got[5] = { net->convOutput(), net->projOutput(), net->hidden1(), net->hidden2(), masks };
+        size_t offset = k * size_t(kLayerTotal);
+        for (int layer = 0; layer < 5; ++layer)
+        {
+            for (int i = 0; i < sizes[layer]; ++i)
+            {
+                err[layer].e32 = std::max(err[layer].e32, std::abs(double(got[layer][i]) - double(ref32[offset + size_t(i)])));
+                err[layer].e64 = std::max(err[layer].e64, std::abs(double(got[layer][i]) - ref64[offset + size_t(i)]));
+            }
+            offset += size_t(sizes[layer]);
+        }
+    }
+    for (int layer = 0; layer < 5; ++layer)
+    {
+        std::printf("  %-6s vs float32 %.3e   vs float64 %.3e\n", names[layer], err[layer].e32, err[layer].e64);
+        ZFB_CHECK_MSG(err[layer].e32 < kNetToleranceVsFloat32, fmt("%.3e (float32 reference)", err[layer].e32));
+        ZFB_CHECK_MSG(err[layer].e64 < kNetToleranceVsFloat64, fmt("%.3e (float64 reference)", err[layer].e64));
+    }
+
+    // reset() returns the network to its initial state.
+    net->reset();
+    net->infer(feat.data(), masks);
+    double eReset = 0.0;
+    for (int i = 0; i < kMaskSize; ++i)
+        eReset = std::max(eReset, std::abs(double(masks[i]) - double(ref32[size_t(kLayerTotal - kMaskSize + i)])));
+    ZFB_CHECK_MSG(eReset < kNetToleranceVsFloat32, fmt("after reset %.3e", eReset));
+
+    // Without weights the estimator passes everything.
+    CausalGruEngine empty;
+    empty.infer(feat.data(), masks);
+    bool unity = true;
+    for (int i = 0; i < kMaskSize; ++i)
+        unity = unity && masks[i] == 1.0f;
+    ZFB_CHECK(unity && ! empty.hasWeights());
+}
+
+/** Forwards to the real network and keeps a copy of the masks of each frame. */
+struct CapturingEstimator : MaskEstimator
+{
+    CausalGruEngine net { embedded::kWeights };
+    std::vector<float> masks;
+    size_t frame = 0;
+    void reset() noexcept override { net.reset(); }
+    void infer(const float* features, float* out) noexcept override
+    {
+        net.infer(features, out);
+        if ((frame + 1) * size_t(kMaskSize) <= masks.size())
+            std::memcpy(masks.data() + frame * size_t(kMaskSize), out, sizeof(float) * size_t(kMaskSize));
+        ++frame;
+    }
+};
+
+void testMasksEndToEnd(const std::string& dir)
+{
+    section("64-channel masks end to end (audio -> C++ features -> C++ network)");
+    for (const Case& c : kCases)
+    {
+        const auto signal = readFile<float>(dir + "/signal_" + c.name + ".f32");
+        const auto ref64 = readFile<double>(dir + "/masks_" + c.name + ".f64");
+        const auto ref32 = readFile<float>(dir + "/masks_" + c.name + ".f32");
+        const int hop = hopForSampleRate(double(c.fs));
+        const size_t samples = signal.size() / size_t(c.channels);
+        const size_t frames = samples / size_t(hop);
+        ZFB_CHECK(frames > 0 && ref64.size() == frames * size_t(kMaskSize) && ref32.size() == ref64.size());
+        if (frames == 0 || ref64.size() != frames * size_t(kMaskSize) || ref32.size() != ref64.size())
+            continue;
+
+        auto estimator = std::make_unique<CapturingEstimator>();
+        estimator->masks.assign(ref64.size(), 0.0f);
+        auto engine = std::make_unique<ZeroFbEngine>();
+        engine->setEstimator(estimator.get());
+        engine->prepare(double(c.fs), c.channels);
+        engine->setParams(EngineParams {});
+
+        std::vector<float> chan[2], out[2];
+        for (int ch = 0; ch < 2; ++ch) { chan[ch].resize(samples); out[ch].resize(samples); }
+        for (size_t n = 0; n < samples; ++n)
+            for (int ch = 0; ch < c.channels; ++ch)
+                chan[ch][n] = signal[n * size_t(c.channels) + size_t(ch)];
+        for (size_t pos = 0; pos < frames * size_t(hop);)
+        {
+            const int n = int(std::min<size_t>(113, frames * size_t(hop) - pos));
+            const float* in[2] = { chan[0].data() + pos, chan[1].data() + pos };
+            float* o[2] = { out[0].data() + pos, out[1].data() + pos };
+            engine->process(in, o, c.channels, c.channels, n);
+            pos += size_t(n);
+        }
+        ZFB_CHECK(estimator->frame == frames);
+
+        double e32 = 0.0, e64 = 0.0;
+        float lo = 1.0f, hi = 0.0f;
+        for (size_t i = 0; i < ref64.size(); ++i)
+        {
+            e32 = std::max(e32, std::abs(double(estimator->masks[i]) - double(ref32[i])));
+            e64 = std::max(e64, std::abs(double(estimator->masks[i]) - ref64[i]));
+            lo = std::min(lo, estimator->masks[i]);
+            hi = std::max(hi, estimator->masks[i]);
+        }
+        std::printf("  %-13s vs float32 %.3e   vs float64 %.3e   (mask range %.3f .. %.3f)\n", c.name, e32, e64, lo, hi);
+        ZFB_CHECK_MSG(e32 < kMaskToleranceEndToEnd, fmt("%.3e (float32 reference)", e32));
+        ZFB_CHECK_MSG(e64 < kMaskToleranceEndToEnd, fmt("%.3e (float64 reference)", e64));
+        ZFB_CHECK(hi - lo > 0.2f); // the test weights must actually move the masks
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -251,5 +453,9 @@ int main(int argc, char** argv)
     testBandLayout();
     testFeatures(argv[1]);
     testCoupling(argv[1]);
+    testVectorActivations();
+    testModelFile(argv[1]);
+    testNetworkLayers(argv[1]);
+    testMasksEndToEnd(argv[1]);
     return finish("GoldenParityTest");
 }
