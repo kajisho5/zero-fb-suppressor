@@ -12,7 +12,12 @@ otherwise generation fails. That bound is the rounding noise of single
 precision itself (weak out-of-band leakage next to a strong tone), so it is the
 tightest bound any float implementation can be held to against float64.
 
-The fixtures are about 140 MB, so they are generated at build time instead of
+Step 2 adds the network: test_model.swmodel holds fixed pseudo-random weights
+(not a trained model), masks_* the 64 mask outputs for every frame, and
+nn_layers_* every layer output (conv1, proj, gru1, gru2, masks = 864 values)
+for the first frames of one case.
+
+The fixtures are about 200 MB, so they are generated at build time instead of
 being committed. sha256.txt lists every generated file.
 
 Usage: gen_golden_fixtures.py OUTPUT_DIR
@@ -27,10 +32,15 @@ from pathlib import Path
 import numpy as np
 
 import erb_dsp as E
+import export_weights as X
+import nn_reference as R
 
 SEED = 42
 DURATION_SEC = 5.0
 PY_FP32_TOLERANCE = 1e-3
+PY_FP32_MASK_TOLERANCE = 1e-4
+NN_LAYER_CASE = "48000_stereo"
+NN_LAYER_FRAMES = 2000
 CASES = [(44100, 2), (48000, 2), (96000, 2), (48000, 1)]
 
 
@@ -100,6 +110,10 @@ def main() -> int:
     rng = np.random.default_rng(SEED)
     written = []
 
+    weights = X.random_test_weights(SEED)
+    (out / "test_model.swmodel").write_bytes(X.pack(weights))
+    written.append("test_model.swmodel")
+
     signals = {fs: test_signal(fs, rng) for fs in sorted({fs for fs, _ in CASES})}
     for fs, channels in CASES:
         name = f"{fs}_{'stereo' if channels == 2 else 'mono'}"
@@ -115,6 +129,22 @@ def main() -> int:
         ref64.astype("<f8").tofile(out / f"features_{name}.f64")
         ref32.astype("<f4").tofile(out / f"features_{name}.f32")
         written += [f"signal_{name}.f32", f"features_{name}.f64", f"features_{name}.f32"]
+
+        keep = NN_LAYER_FRAMES if name == NN_LAYER_CASE else 0
+        masks64, layers64 = R.NumpyNet(weights, np.float64).run(ref64, keep)
+        masks32, layers32 = R.NumpyNet(weights, np.float32).run(ref32, keep)
+        err = float(np.max(np.abs(masks32.astype(np.float64) - masks64)))
+        print(f"{name}: masks python fp32 vs fp64 max abs error = {err:.3e}")
+        if not err < PY_FP32_MASK_TOLERANCE:
+            print(f"error: float32 network deviates by more than {PY_FP32_MASK_TOLERANCE}")
+            return 1
+        masks64.astype("<f8").tofile(out / f"masks_{name}.f64")
+        masks32.astype("<f4").tofile(out / f"masks_{name}.f32")
+        written += [f"masks_{name}.f64", f"masks_{name}.f32"]
+        if keep:
+            layers64.astype("<f8").tofile(out / f"nn_layers_{name}.f64")
+            layers32.astype("<f4").tofile(out / f"nn_layers_{name}.f32")
+            written += [f"nn_layers_{name}.f64", f"nn_layers_{name}.f32"]
 
     for fs in sorted(E.HOP_FOR_RATE):
         coupling_cases(fs, rng).astype("<f8").tofile(out / f"coupling_{fs}.f64")
