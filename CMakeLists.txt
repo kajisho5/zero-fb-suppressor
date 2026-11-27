@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 
-# Software version. The specification document has its own number (SPEC v1.6).
-project(ZeroFbSuppressor VERSION 0.1.0 LANGUAGES CXX)
+# Software version. The specification document has its own number (SPEC v1.7).
+project(ZeroFbSuppressor VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,9 +12,13 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(ZEROFB_BUILD_TESTS "Build the DSP core tests" ON)
+option(ZEROFB_BUILD_PLUGIN "Build the VST3 / AU plug-in (downloads JUCE)" OFF)
 
-# DSP core: header only, no JUCE dependency. The plug-in targets (VST3 / AU)
-# are added in milestone Step 4.
+if(ZEROFB_BUILD_PLUGIN AND APPLE)
+    enable_language(OBJC OBJCXX)
+endif()
+
+# DSP core: header only, no JUCE dependency.
 add_library(zerofb_core INTERFACE)
 target_include_directories(zerofb_core INTERFACE plugin/Source)
 
@@ -28,7 +32,12 @@ else()
     # No fused multiply-add contraction: the AVX2, NEON and scalar paths and
     # the NumPy reference must perform the same IEEE operations.
     target_compile_options(zerofb_core INTERFACE -O3 -ffp-contract=off -Wall -Wextra -Wconversion -Wshadow)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES "x86_64" AND CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        # Universal build: AVX2 for the Intel slice only, NEON for arm64.
+        target_compile_options(zerofb_core INTERFACE
+            "SHELL:-Xarch_x86_64 -mavx2" "SHELL:-Xarch_x86_64 -mfma")
+    elseif(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64"
+           OR (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64"))
         # -mfma is used only by the explicit intrinsics in nn/SimdKernels.h.
         target_compile_options(zerofb_core INTERFACE -mavx2 -mfma)
     endif()
@@ -50,7 +59,7 @@ if(ZEROFB_BUILD_TESTS)
     add_custom_target(zerofb_fixtures ALL DEPENDS "${ZEROFB_FIXTURE_STAMP}")
 
     # EmbeddedWeights.h with the fixed test weights (seed 42, not a trained
-    # model). The trained weights are committed to plugin/Source/nn in Step 3.
+    # model). Trained weights are never committed (SPEC 3.2).
     set(ZEROFB_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
     set(ZEROFB_TEST_WEIGHTS "${ZEROFB_GENERATED_DIR}/nn/EmbeddedWeights.h")
     add_custom_command(
@@ -98,4 +107,93 @@ if(ZEROFB_BUILD_TESTS)
     add_test(NAME ClosedLoopBench COMMAND ClosedLoopBench)
     set_tests_properties(ClosedLoopBench PROPERTIES TIMEOUT 1800)
     target_compile_definitions(GoldenParityTest_scalar PRIVATE ZEROFB_EXACT_MATH=1 ZEROFB_FORCE_SCALAR=1)
+endif()
+
+# ---------------------------------------------------------------------------
+# Plug-in (SPEC chapter 6). JUCE is AGPLv3, like this project.
+if(ZEROFB_BUILD_PLUGIN)
+    include(FetchContent)
+    FetchContent_Declare(JUCE
+        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+        GIT_TAG 9.0.6
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(JUCE)
+
+    set(ZEROFB_FORMATS VST3)
+    if(APPLE)
+        list(APPEND ZEROFB_FORMATS AU)
+    endif()
+
+    juce_add_plugin(ZeroFb
+        VERSION ${PROJECT_VERSION}
+        COMPANY_NAME "SEVENTHWELL"
+        COMPANY_WEBSITE "https://seventh-well.com"
+        BUNDLE_ID "com.seventhwell.zerofb"
+        PLUGIN_MANUFACTURER_CODE Svwl
+        PLUGIN_CODE Zfb1
+        PRODUCT_NAME "ZERO-FB"
+        FORMATS ${ZEROFB_FORMATS}
+        IS_SYNTH FALSE
+        NEEDS_MIDI_INPUT FALSE
+        NEEDS_MIDI_OUTPUT FALSE
+        IS_MIDI_EFFECT FALSE
+        EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+        VST3_CATEGORIES Fx Restoration
+        AU_MAIN_TYPE kAudioUnitType_Effect
+        COPY_PLUGIN_AFTER_BUILD FALSE)
+
+    juce_add_binary_data(ZeroFbAssets SOURCES
+        plugin/Assets/Fonts/Michroma-Regular.ttf
+        plugin/Assets/Fonts/BarlowCondensed-Regular.ttf
+        plugin/Assets/Fonts/BarlowCondensed-Medium.ttf
+        plugin/Assets/Fonts/BarlowCondensed-SemiBold.ttf
+        plugin/Assets/Fonts/BarlowCondensed-Bold.ttf
+        plugin/Assets/Fonts/SpaceMono-Regular.ttf
+        plugin/Assets/Fonts/SpaceMono-Bold.ttf)
+    set_target_properties(ZeroFbAssets PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_sources(ZeroFb PRIVATE
+        plugin/Source/PluginProcessor.cpp
+        plugin/Source/PluginEditor.cpp)
+
+    target_compile_definitions(ZeroFb PUBLIC
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_VST3_CAN_REPLACE_VST2=0
+        JUCE_DISPLAY_SPLASH_SCREEN=0
+        JUCE_REPORT_APP_USAGE=0)
+
+    target_link_libraries(ZeroFb
+        PRIVATE
+            ZeroFbAssets
+            juce::juce_audio_utils
+        PUBLIC
+            zerofb_core
+            juce::juce_recommended_config_flags)
+
+    # The two tools below link the plug-in's shared code (JUCE modules,
+    # processor, editor) so that nothing is compiled twice.
+
+    # Renders the editor to a PNG (no host needed). Not part of the plug-in.
+    function(zerofb_add_plugin_tool name source)
+        add_executable(${name} ${source})
+        # JUCE modules are linked privately into ZeroFb, so pass its include
+        # paths and definitions on by hand.
+        target_include_directories(${name} PRIVATE $<TARGET_PROPERTY:ZeroFb,INCLUDE_DIRECTORIES>)
+        target_compile_definitions(${name} PRIVATE $<TARGET_PROPERTY:ZeroFb,COMPILE_DEFINITIONS>)
+        target_link_libraries(${name} PRIVATE ZeroFb)
+    endfunction()
+
+    zerofb_add_plugin_tool(UiSnapshot plugin/tools/UiSnapshot.cpp)
+
+    # Host-less checks of the AudioProcessor wrapper, including the one hour
+    # endurance run of SPEC chapter 9, with the fixed test weights so that the
+    # network really runs.
+    if(ZEROFB_BUILD_TESTS)
+        zerofb_add_plugin_tool(PluginSoakTest plugin/tests/PluginSoakTest.cpp)
+        target_include_directories(PluginSoakTest PRIVATE "${ZEROFB_GENERATED_DIR}")
+        add_dependencies(PluginSoakTest zerofb_test_weights)
+        add_test(NAME PluginSoakTest COMMAND PluginSoakTest 3600)
+        set_tests_properties(PluginSoakTest PROPERTIES TIMEOUT 3000)
+    endif()
 endif()

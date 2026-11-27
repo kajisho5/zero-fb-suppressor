@@ -1,4 +1,4 @@
-# ZERO-FB: Zero-Latency AI Feedback & Dereverb Suppressor 単一正本設計書（SPEC.md v1.6）
+# ZERO-FB: Zero-Latency AI Feedback & Dereverb Suppressor 単一正本設計書（SPEC.md v1.7）
 
 > **実装エージェント（Claude / Claude Code）および仕様監査役への宣言:**
 > 本書は、過去の分冊（v1.2 / 補遺04 / 補完リスト05 / v1.3）および10世代プローブ・監査指摘事項をすべて統合し、すべての数式・状態遷移・バイナリ配置・受入試験プロトコルを1択へ確定させた**唯一の単一正本（Single Source of Truth）**である。
@@ -6,9 +6,17 @@
 > 実装は「第9章：実装マイルストーン（Step 1 〜 Step 4）」の順に実施し、各ステップの自動テストがすべて合格してから次へ進むこと。
 
 ### バージョン番号の読み方
-* **設計書のバージョン**: 本書は `SPEC v1.6`。これは文書の番号であり、ソフトの番号ではない。
+* **設計書のバージョン**: 本書は `SPEC v1.7`。これは文書の番号であり、ソフトの番号ではない。
 * **ソフトのバージョン**: 最初のリリースは **`v0.1.0`**（本書の実装対象）。狭帯域ノッチ（Stage 6B）を足すリリースは **`v0.2.0`**。
 * **保存データ・重みファイルの番号**: `state_version="1"` と Magic `"SWZFB004"` はそれぞれ独立した形式番号で、ソフトのバージョンとは連動しない。
+
+### v1.7 への変更点（Step 4 実装時に確定）
+1. **第6.3節 画面**: デザインを SW AUDIO の LIVE ライン準拠（`760 × 440 px`）に差し替えた。旧マスター（`720 × 380 px`）は廃止。設計書に埋め込んでいた SVG 全文は削除し、`docs/ui_master.svg` を唯一のマスターとする。
+2. **第6.2節 フォント**: `Michroma`（ロゴ）／`Barlow Condensed`（ラベル）／`Space Mono`（数値）に変更（すべて SIL OFL 1.1）。プラグインの画面に日本語は出さないため `Noto Sans JP` は埋め込まない。
+3. **ライセンス・配布**: 本ソフトは **AGPLv3**。Mac の署名・公証は `kajisho5/runway` の共通の仕組みを使うため、第8章にあった `scripts/package_macos.sh` は作らない。JUCE は `9.0.6`（AGPLv3 で利用。<https://github.com/juce-framework/JUCE/releases/tag/9.0.6>）。
+4. **第6.2節 プリセット**: 画面にプリセットのボタン4個を置く。第6.1節の初期値（`DEREVERB 50%`）はどのプリセットとも一致しないため、起動直後はどのボタンも点灯しない（仕様どおり。初期値は変えていない）。
+5. **モデル未搭載時の表示**: 学習済みの重みを差し込まずにビルドしたプラグインは全マスク `1.0`（抑制なし）で動き、画面下の帯に `NO MODEL LOADED` と出す。
+6. **第9章 Step 4**: ホストなしで `AudioProcessor` を検査する `PluginSoakTest` を追加（バス構成・Bit-Perfect バイパス・状態保存・プリセット・1時間耐久）。xrun は実機のオーディオ装置でしか判定できないため、テストでは締め切り超過の回数を参考表示にとどめ、合否はヒープ確保 0 と非有限値 0 で付ける。
 
 ### v1.6 への追記（Step 3 着手時に確定）
 1. **第3.2節 `EmbeddedWeights.h`**: 学習済みの重みは公開リポジトリには入れず、手元でビルド時に差し込む（個人利用専用。非商用データで学習した重みの公開は配布に当たるため）。
@@ -469,7 +477,7 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
    * `ZEROFB_EXACT_MATH` を定義したビルドは同じ箇所で `std::` 関数を使う（第7.2節の厳しい側の照合用）。
    * コンパイラの積和融合は無効にする（GCC / Clang は `-ffp-contract=off`、MSVC は `/fp:precise`）。`-ffast-math` は使わない（`isfinite` 判定が壊れるため）。
 4. **状態保存（APVTS）**: XML に `state_version="1"` 属性を付与して保存し、後方互換を維持する。
-5. **ロックフリーUI通信**: `std::atomic<float>` 配列（32バンド現在GR値、IN/OUTピーク、最大Ring帯域周波数、CPU負荷率）と `std::atomic<bool>`（`RESET` トリガー）による単一方向通信のみを使用。
+5. **ロックフリーUI通信**: `std::atomic` の値（32バンド現在GR値、Hold 中の帯域を表すビット列、IN/OUTピーク、CPU負荷率、ブロック長）による単一方向通信のみを使用。`RING` の周波数表示は画面側が GR 値と Hold ビット列から求める。`RESET` は APVTS のパラメータ経由。
 
 ---
 
@@ -491,188 +499,22 @@ if (voice_ovr_rem > 0) --voice_ovr_rem;
   2. `02_Handheld_Speech`: `SUPPRESS 75%`, `DEREVERB 40%`, `FLOOR -24dB`, `SPEECH`
   3. `03_Live_Vocal`: `SUPPRESS 65%`, `DEREVERB 25%`, `FLOOR -15dB`, `VOCAL`
   4. `04_Feedback_Only`: `SUPPRESS 85%`, `DEREVERB 0%`, `FLOOR -30dB`, `SPEECH`
-* **UX 操作**: ダブルクリックでデフォルト復帰、`Shift/Cmd + ドラッグ` で微調整、数値クリックでキーボード直接入力。
-* **埋め込みフォント**: `juce_add_binary_data` で埋め込み。商用配布時の既定フォントは SIL OFL の `Orbitron`（ロゴタイトル）＋ `Space Mono`（数値・ラベル）＋ `Noto Sans JP`（補助）とする。
+* **プリセットのボタン**: 画面に4個並べる（表示は `CONF LAV` / `HANDHELD` / `LIVE VOCAL` / `FB ONLY`）。4つの値がプリセットと一致している間だけ点灯する。ホストのプログラム一覧にも同じ4個を出す。
+* **UX 操作**: ダブルクリックでデフォルト復帰、`Shift/Cmd(Ctrl) + ドラッグ` で微調整、数値クリックでキーボード直接入力。
+* **埋め込みフォント**: `juce_add_binary_data` で埋め込み。SIL OFL 1.1 の `Michroma`（ロゴ）＋ `Barlow Condensed`（ラベル・ボタン）＋ `Space Mono`（数値）。ライセンス文は `plugin/Assets/Fonts/OFL-*.txt`。画面に日本語は出さない。
 
-### 6.3 UIデザインマスター（`docs/ui_master.svg` / `720 × 380 px`）
-* Step 4 の自動検査にて `docs/ui_master.svg` が標準 XML/SVG としてエラーなくパースできることを検証する。
-
-```xml
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 380" width="720" height="380">
-  <defs>
-    <style>
-      .font-brand { font-family: 'Orbitron', 'Space Mono', sans-serif; font-weight: 700; letter-spacing: 2px; }
-      .font-mono  { font-family: 'Space Mono', monospace; }
-      .font-jp    { font-family: 'Noto Sans JP', sans-serif; }
-    </style>
-  </defs>
-
-  <rect x="0" y="0" width="720" height="380" fill="#0A0A0C"/>
-
-  <!-- Layer 1: Background Frame -->
-  <g id="bg-frame">
-    <rect x="12" y="12" width="696" height="356" rx="6" fill="#111115" stroke="#26262E" stroke-width="1"/>
-    <line x1="12" y1="56" x2="708" y2="56" stroke="#26262E" stroke-width="1"/>
-    <line x1="12" y1="236" x2="708" y2="236" stroke="#26262E" stroke-width="1"/>
-  </g>
-
-  <!-- Layer 2: Header Bar -->
-  <g id="header-bar">
-    <g transform="translate(28, 24)">
-      <rect x="0" y="0" width="20" height="20" rx="3" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-      <line x1="5" y1="4" x2="5" y2="16" stroke="#18E0D0" stroke-width="2"/>
-      <line x1="10" y1="7" x2="10" y2="16" stroke="#F4F4F6" stroke-width="2"/>
-      <line x1="15" y1="10" x2="15" y2="16" stroke="#71717A" stroke-width="2"/>
-    </g>
-    <text x="56" y="38" fill="#F4F4F6" font-size="13" class="font-brand">ZERO-FB</text>
-    <text x="154" y="37" fill="#71717A" font-size="9" class="font-mono">ZERO-LATENCY AI SUPPRESSOR</text>
-
-    <rect x="330" y="23" width="106" height="22" rx="3" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-    <circle cx="340" cy="34" r="3" fill="#18E0D0"/>
-    <text x="348" y="37" fill="#A1A1AA" font-size="9" class="font-mono">0.0ms / 0smp</text>
-
-    <rect x="444" y="23" width="112" height="22" rx="3" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-    <rect x="446" y="25" width="54" height="18" rx="2" fill="#18E0D0"/>
-    <text x="473" y="37" fill="#0A0A0C" font-size="9" font-weight="700" text-anchor="middle" class="font-mono">SPEECH</text>
-    <text x="528" y="37" fill="#71717A" font-size="9" text-anchor="middle" class="font-mono">VOCAL</text>
-
-    <rect x="564" y="23" width="58" height="22" rx="3" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-    <text x="593" y="37" fill="#F4F4F6" font-size="9" text-anchor="middle" class="font-mono">RESET</text>
-
-    <rect x="630" y="23" width="64" height="22" rx="3" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-    <text x="662" y="37" fill="#A1A1AA" font-size="9" text-anchor="middle" class="font-mono">BYPASS</text>
-  </g>
-
-  <!-- Layer 3: 32-Band ERB Gain Reduction Analyzer -->
-  <g id="analyzer-canvas">
-    <g fill="#71717A" font-size="9" text-anchor="end" class="font-mono">
-      <text x="42" y="75">0dB</text>
-      <text x="42" y="111">-6</text>
-      <text x="42" y="147">-12</text>
-      <text x="42" y="183">-18</text>
-      <text x="42" y="219">-24</text>
-    </g>
-    <g stroke="#1C1C22" stroke-width="1">
-      <line x1="48" y1="72" x2="692" y2="72" stroke="#26262E"/>
-      <line x1="48" y1="108" x2="692" y2="108"/>
-      <line x1="48" y1="144" x2="692" y2="144"/>
-      <line x1="48" y1="180" x2="692" y2="180"/>
-      <line x1="48" y1="216" x2="692" y2="216" stroke="#26262E" stroke-dasharray="3,3"/>
-    </g>
-
-    <g fill="#71717A" font-size="9" text-anchor="middle" class="font-mono">
-      <text x="55" y="229">60Hz</text>
-      <text x="148" y="229">150Hz</text>
-      <text x="250" y="229">400Hz</text>
-      <text x="370" y="229">1kHz</text>
-      <text x="490" y="229">2.5kHz</text>
-      <text x="598" y="229">6kHz</text>
-      <text x="680" y="229">15kHz</text>
-    </g>
-
-    <g id="gr-bars">
-      <rect x="51"  y="72" width="14" height="48" fill="#18E0D0" fill-opacity="0.24"/><rect x="51"  y="118" width="14" height="2" fill="#18E0D0"/>
-      <rect x="71"  y="72" width="14" height="42" fill="#18E0D0" fill-opacity="0.24"/><rect x="71"  y="112" width="14" height="2" fill="#18E0D0"/>
-      <rect x="91"  y="72" width="14" height="36" fill="#18E0D0" fill-opacity="0.24"/><rect x="91"  y="106" width="14" height="2" fill="#18E0D0"/>
-      <rect x="111" y="72" width="14" height="30" fill="#18E0D0" fill-opacity="0.24"/><rect x="111" y="100" width="14" height="2" fill="#18E0D0"/>
-      <rect x="132" y="72" width="14" height="26" fill="#18E0D0" fill-opacity="0.24"/><rect x="132" y="96"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="152" y="72" width="14" height="22" fill="#18E0D0" fill-opacity="0.24"/><rect x="152" y="92"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="172" y="72" width="14" height="18" fill="#18E0D0" fill-opacity="0.24"/><rect x="172" y="88"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="192" y="72" width="14" height="16" fill="#18E0D0" fill-opacity="0.24"/><rect x="192" y="86"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="212" y="72" width="14" height="12" fill="#18E0D0" fill-opacity="0.24"/><rect x="212" y="82"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="232" y="72" width="14" height="10" fill="#18E0D0" fill-opacity="0.24"/><rect x="232" y="80"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="252" y="72" width="14" height="8"  fill="#18E0D0" fill-opacity="0.24"/><rect x="252" y="78"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="272" y="72" width="14" height="8"  fill="#18E0D0" fill-opacity="0.24"/><rect x="272" y="78"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="293" y="72" width="14" height="10" fill="#18E0D0" fill-opacity="0.24"/><rect x="293" y="80"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="313" y="72" width="14" height="11" fill="#18E0D0" fill-opacity="0.24"/><rect x="313" y="81"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="333" y="72" width="14" height="10" fill="#18E0D0" fill-opacity="0.24"/><rect x="333" y="80"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="353" y="72" width="14" height="9"  fill="#18E0D0" fill-opacity="0.24"/><rect x="353" y="79"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="373" y="72" width="14" height="12" fill="#18E0D0" fill-opacity="0.24"/><rect x="373" y="82"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="393" y="72" width="14" height="15" fill="#18E0D0" fill-opacity="0.24"/><rect x="393" y="85"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="413" y="72" width="14" height="88" fill="#FF5A36" fill-opacity="0.32"/><rect x="413" y="158" width="14" height="2" fill="#FF5A36"/>
-      <rect x="433" y="72" width="14" height="54" fill="#FF5A36" fill-opacity="0.24"/><rect x="433" y="124" width="14" height="2" fill="#FF5A36"/>
-      <rect x="454" y="72" width="14" height="22" fill="#18E0D0" fill-opacity="0.24"/><rect x="454" y="92"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="474" y="72" width="14" height="18" fill="#18E0D0" fill-opacity="0.24"/><rect x="474" y="88"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="494" y="72" width="14" height="16" fill="#18E0D0" fill-opacity="0.24"/><rect x="494" y="86"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="514" y="72" width="14" height="18" fill="#18E0D0" fill-opacity="0.24"/><rect x="514" y="88"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="534" y="72" width="14" height="20" fill="#18E0D0" fill-opacity="0.24"/><rect x="534" y="90"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="554" y="72" width="14" height="24" fill="#18E0D0" fill-opacity="0.24"/><rect x="554" y="94"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="574" y="72" width="14" height="28" fill="#18E0D0" fill-opacity="0.24"/><rect x="574" y="98"  width="14" height="2" fill="#18E0D0"/>
-      <rect x="594" y="72" width="14" height="32" fill="#18E0D0" fill-opacity="0.24"/><rect x="594" y="102" width="14" height="2" fill="#18E0D0"/>
-      <rect x="615" y="72" width="14" height="36" fill="#18E0D0" fill-opacity="0.24"/><rect x="615" y="106" width="14" height="2" fill="#18E0D0"/>
-      <rect x="635" y="72" width="14" height="40" fill="#18E0D0" fill-opacity="0.24"/><rect x="635" y="110" width="14" height="2" fill="#18E0D0"/>
-      <rect x="655" y="72" width="14" height="44" fill="#18E0D0" fill-opacity="0.24"/><rect x="655" y="114" width="14" height="2" fill="#18E0D0"/>
-      <rect x="675" y="72" width="14" height="46" fill="#18E0D0" fill-opacity="0.24"/><rect x="675" y="116" width="14" height="2" fill="#18E0D0"/>
-    </g>
-
-    <rect x="404" y="166" width="52" height="15" rx="2" fill="#16161B" stroke="#FF5A36" stroke-width="1"/>
-    <text x="430" y="176" fill="#FF5A36" font-size="8" text-anchor="middle" class="font-mono">RING 2.1k</text>
-  </g>
-
-  <!-- Layer 4: Control Deck -->
-  <g id="control-deck">
-    <g id="meter-in">
-      <text x="48" y="256" fill="#A1A1AA" font-size="9" text-anchor="middle" class="font-mono">IN</text>
-      <rect x="44" y="264" width="8" height="76" rx="2" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-      <rect x="45" y="286" width="6" height="53" rx="1" fill="#A1A1AA"/>
-      <text x="48" y="354" fill="#71717A" font-size="9" text-anchor="middle" class="font-mono">-14</text>
-    </g>
-
-    <g id="knob-suppress">
-      <text x="164" y="252" fill="#A1A1AA" font-size="10" text-anchor="middle" class="font-mono">SUPPRESS</text>
-      <path d="M 138.5 321.5 A 36 36 0 1 1 189.5 321.5" fill="none" stroke="#26262E" stroke-width="4" stroke-linecap="round"/>
-      <path d="M 138.5 321.5 A 36 36 0 1 1 198.8 286.7" fill="none" stroke="#18E0D0" stroke-width="4" stroke-linecap="round"/>
-      <circle cx="164" cy="296" r="27" fill="#16161B" stroke="#32323E" stroke-width="1.5"/>
-      <line x1="164" y1="296" x2="186" y2="290" stroke="#F4F4F6" stroke-width="2.5" stroke-linecap="round"/>
-      <text x="164" y="354" fill="#F4F4F6" font-size="12" font-weight="700" text-anchor="middle" class="font-mono">75 %</text>
-    </g>
-
-    <g id="knob-dereverb">
-      <text x="304" y="256" fill="#A1A1AA" font-size="9" text-anchor="middle" class="font-mono">DEREVERB</text>
-      <path d="M 285.6 314.4 A 26 26 0 1 1 322.4 314.4" fill="none" stroke="#26262E" stroke-width="3" stroke-linecap="round"/>
-      <path d="M 285.6 314.4 A 26 26 0 0 1 304 270" fill="none" stroke="#18E0D0" stroke-width="3" stroke-linecap="round"/>
-      <circle cx="304" cy="296" r="19" fill="#16161B" stroke="#32323E" stroke-width="1.2"/>
-      <line x1="304" y1="296" x2="304" y2="280" stroke="#F4F4F6" stroke-width="2" stroke-linecap="round"/>
-      <text x="304" y="348" fill="#E4E4E7" font-size="10" text-anchor="middle" class="font-mono">50 %</text>
-    </g>
-
-    <g id="knob-floor">
-      <text x="424" y="256" fill="#A1A1AA" font-size="9" text-anchor="middle" class="font-mono">FLOOR</text>
-      <path d="M 405.6 314.4 A 26 26 0 1 1 442.4 314.4" fill="none" stroke="#26262E" stroke-width="3" stroke-linecap="round"/>
-      <path d="M 405.6 314.4 A 26 26 0 0 1 432 271.3" fill="none" stroke="#18E0D0" stroke-width="3" stroke-linecap="round"/>
-      <circle cx="424" cy="296" r="19" fill="#16161B" stroke="#32323E" stroke-width="1.2"/>
-      <line x1="424" y1="296" x2="429" y2="281" stroke="#F4F4F6" stroke-width="2" stroke-linecap="round"/>
-      <text x="424" y="348" fill="#E4E4E7" font-size="10" text-anchor="middle" class="font-mono">-24 dB</text>
-    </g>
-
-    <g id="telemetry-box">
-      <rect x="492" y="254" width="120" height="96" rx="4" fill="#0D0D10" stroke="#22222A" stroke-width="1"/>
-      <text x="502" y="274" fill="#71717A" font-size="8" class="font-mono">MAX GR</text>
-      <text x="602" y="274" fill="#18E0D0" font-size="9" text-anchor="end" class="font-mono">-14.8 dB</text>
-      <line x1="502" y1="283" x2="602" y2="283" stroke="#1C1C22" stroke-width="1"/>
-
-      <text x="502" y="302" fill="#71717A" font-size="8" class="font-mono">RING PEAK</text>
-      <text x="602" y="302" fill="#FF5A36" font-size="9" text-anchor="end" class="font-mono">2.15 kHz</text>
-      <line x1="502" y1="311" x2="602" y2="311" stroke="#1C1C22" stroke-width="1"/>
-
-      <text x="502" y="330" fill="#71717A" font-size="8" class="font-mono">LOAD / BUF</text>
-      <text x="602" y="330" fill="#A1A1AA" font-size="9" text-anchor="end" class="font-mono">6.2% / 16</text>
-    </g>
-
-    <g id="meter-out">
-      <text x="646" y="256" fill="#A1A1AA" font-size="9" text-anchor="middle" class="font-mono">GR</text>
-      <rect x="642" y="264" width="8" height="76" rx="2" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-      <rect x="643" y="265" width="6" height="36" rx="1" fill="#18E0D0"/>
-      <text x="646" y="354" fill="#18E0D0" font-size="9" text-anchor="middle" class="font-mono">-15</text>
-
-      <text x="670" y="256" fill="#A1A1AA" font-size="9" text-anchor="middle" class="font-mono">OUT</text>
-      <rect x="666" y="264" width="8" height="76" rx="2" fill="#16161B" stroke="#26262E" stroke-width="1"/>
-      <rect x="667" y="288" width="6" height="51" rx="1" fill="#E4E4E7"/>
-      <text x="670" y="354" fill="#71717A" font-size="9" text-anchor="middle" class="font-mono">-14</text>
-    </g>
-  </g>
-</svg>
-```
+### 6.3 UIデザインマスター（`docs/ui_master.svg` / `760 × 440 px`）
+* SW AUDIO の LIVE ライン準拠。区分色は Restore（`#6aa832`、リング `#8fd14a`、耳 `#335a12`）。状態色は OK `#2bd14a`／注意 `#f0c93d`／超過 `#e0443e` で、区分色とは混ぜない。
+* 画面の大きさは固定（`760 × 440 px`、リサイズなし）。座標・色・文字の大きさは `docs/ui_master.svg` に合わせる。
+* 構成（上から）:
+  1. **ツールバー（40 px＋区分色の帯 3 px）**: `SW AUDIO` ／ `LIVE` ／ `ZERO-FB`、レイテンシー表示（`0 smp` / `0.0 ms`。LIVE ラインでは常時表示）、`MODE`（`SPEECH` / `VOCAL`）、`RESET`（押している間だけ ON）、`BYPASS`。
+  2. **GAIN REDUCTION 表示（左）**: 32バンドの現在の GR を棒で表示（縦軸 `0 〜 -24 dB`、横は ERB 配置どおり）。Hold 中の帯域は注意色にし、いちばん深い Hold 帯域の中心周波数を `RING x.xx kHz` と出す。右上に最大 GR。
+  3. **プリセットのボタン4個**（高さ 44 px）。
+  4. **IN / GR / OUT メーター**（各36セグメント。IN/OUT は 1 セグメント 1 dB、下限 `-36 dBFS`）。
+  5. **右列**: `SUPPRESS`（大）、`DEREVERB`・`FLOOR`（小）の LED リング（各32セグメント）。数値は中央に表示。
+  6. **下の帯（30 px）**: 動作の一言説明、`CPU x.x %`、`BUF n`。対応外のサンプリングレートのとき、および学習済みの重みが無いときは注意色で知らせる。
+* SW AUDIO 標準機能のうち Morph・Auto gain・Δ・SW Link・Lock・Remote は本書の対象外で、実装しない。
+* 自動検査: `docs/ui_master.svg` が標準 XML/SVG としてエラーなくパースできること。実際の描画は `UiSnapshot`（ホストなしで画面を PNG に書き出す道具）で作り、マスターと目で見比べる。`docs/ui_render.png` がその出力。
 
 ---
 
@@ -744,14 +586,14 @@ $$x_{\text{mic}}[n] = s_{\text{voice}}[n] + G \cdot (h_{\text{room}} * y_{\text{
 
 ```text
 zero-fb-suppressor/
-├── CMakeLists.txt                   # DSPコア＋テスト（Step 1〜2）。JUCE の VST3/AU ターゲットは Step 4 で追加
-├── .github/workflows/ci.yml         # Linux/macOS/Windows 自動ビルド + 全テスト（pluginval は Step 4 で追加）
-├── scripts/
-│   └── package_macos.sh             # codesign + notarytool 公証 + .pkg 生成
+├── CMakeLists.txt                   # DSPコア＋テスト。`-DZEROFB_BUILD_PLUGIN=ON` で JUCE 9.0.6 を取得し VST3/AU をビルド
+├── LICENSE                          # AGPLv3
+├── .github/workflows/ci.yml         # Linux/macOS/Windows 自動ビルド + 全テスト、プラグインのビルド + pluginval（L8）+ auval
 ├── docs/
-│   ├── SPEC.md                      # 本単一正本設計書（v1.6）
+│   ├── SPEC.md                      # 本単一正本設計書（v1.7）
 │   ├── SIMD.md                      # SIMD最適化の実装指針（本書が優先）
-│   └── ui_master.svg                # 720x380 SVGデザインマスター（XMLパース検査対象）
+│   ├── ui_master.svg                # 760x440 SVGデザインマスター（XMLパース検査対象）
+│   └── ui_render.png                # UiSnapshot が書き出した実際の画面
 ├── training/
 │   ├── prepare_data.py              # 48kHz正規化 + 話者/楽曲分離 + ライセンス記載 manifest.json
 │   ├── gen_golden_fixtures.py       # 固定seed 3SRテスト信号 + 独立FP64期待値 + SHA-256生成
@@ -763,7 +605,7 @@ zero-fb-suppressor/
 │   ├── train.py                     # Step 3A (PoC 10k) / Step 3B (Stage A 100k + Stage B 20k)
 │   └── export_weights.py            # .swmodel (671,616B, CRC32) + EmbeddedWeights.h 出力
 └── plugin/
-    ├── Assets/Fonts/                # Orbitron / Space Mono / Noto Sans JP (SIL OFL埋込)
+    ├── Assets/Fonts/                # Michroma / Barlow Condensed / Space Mono (SIL OFL埋込)
     ├── Source/
     │   ├── PluginProcessor.h/.cpp   # AudioProcessor（Stereo Link / APVTS v1 / Bypass同期 / Fail-Safe）
     │   ├── PluginEditor.h/.cpp      # SVG準拠カスタムUI・60fpsタイマー描画・4プリセット
@@ -780,15 +622,18 @@ zero-fb-suppressor/
     │   │   ├── CausalGruEngine.h    # ゼロアロケーション推論エンジン（192in -> 64out）
     │   │   └── EmbeddedWeights.h    # static constexpr alignas(64) 共有重み配列（学習済みは非公開。ビルド時に生成・差し込み）
     │   └── ui/
-    │       ├── CustomLookAndFeel.h  # ジオメトリックノブ・メーター・UX操作実装
+    │       ├── CustomLookAndFeel.h  # 色・フォント・LEDリングのノブ・ボタン・UX操作実装
     │       └── GrAnalyzerView.h     # 32バンドリアルタイムGRキャンバス
+    ├── tools/
+    │   └── UiSnapshot.cpp           # ホストなしで画面を PNG に書き出す（マスターとの見比べ用）
     └── tests/
         ├── TestUtil.h               # テスト共通の小道具
         │                            # （Golden Fixture はビルドフォルダへ生成。リポジトリには入れない）
         ├── ZeroLatencyTest.cpp      # Bit-perfect / 0smp / PGS均一・単一 / 変則BLK / NaN / Heap=0
         ├── GoldenParityTest.cpp     # 近似関数単体 + 3SR特徴量・行列・PGS vs NumPy参照（第7.2節の基準）
         ├── EngineBench.cpp          # 1コールバックのCPU負荷計測（中央値・P99。参考表示）
-        └── ClosedLoopBench.cpp      # 3仮想会場 GBF / ハンチング / ホッピング（Step 2 は骨格。第7.1節）
+        ├── ClosedLoopBench.cpp      # 3仮想会場 GBF / ハンチング / ホッピング（Step 2 は骨格。第7.1節）
+        └── PluginSoakTest.cpp       # ホストなしの AudioProcessor 検査＋1時間耐久（プラグインをビルドするときだけ）
 ```
 
 ---
@@ -809,3 +654,4 @@ zero-fb-suppressor/
 * **Step 4（SVGマスター準拠UI・最終検証・パッケージ化）**:
   * `docs/ui_master.svg`（XML/SVG パース検査パス）の座標・カラー・OFL埋込フォント・UX操作・4プリセットを `PluginEditor` へ実装し、macOS Universal（VST3/AU）および Windows x64（VST3）をビルドする。
   * **完了条件**: `pluginval --strictness-level 8`・`auval` 全パスおよび 48 kHz / 16 samples 1時間耐久 xrun `0 回`・ヒープ増加 `0 bytes` を達成すること。
+  * **状態**: 画面と VST3 / AU のビルドは実装済み（JUCE 9.0.6）。`PluginSoakTest` の1時間耐久でヒープ確保 0・非有限値 0 を確認。`pluginval`（L8）と `auval` は CI で実行する。**未確認**: 実機のオーディオ装置での xrun `0 回`（共有の仮想マシンでは判定できない）、実際の DAW での動作、署名・公証と配布用パッケージ（`kajisho5/runway` を使う。未着手）。学習済みの重みが無いため、配布できるリリースはまだ作らない。
